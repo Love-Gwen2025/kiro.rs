@@ -1,0 +1,67 @@
+# ============================================================================
+# GitHub Actions 工作流: 构建并推送 Docker 镜像 (dev_custom 分支专用)
+# ============================================================================
+# 功能说明:
+#   1. 监听 dev_custom 分支的推送事件
+#   2. 构建 x86_64 Docker 镜像
+#   3. 推送镜像到 GitHub Container Registry (ghcr.io)
+#
+# 镜像标签: ghcr.io/{owner}/kiro-rs:custom
+# ============================================================================
+
+name: Build and Push Docker Images (dev_custom)
+
+# 触发条件: 推送到 dev_custom 分支时触发
+on:
+  push:
+    branches:
+      - dev_custom
+  # 支持手动触发，方便调试
+  workflow_dispatch:
+
+# 权限设置
+permissions:
+  contents: read      # 读取仓库代码
+  packages: write     # 写入 GitHub Packages (ghcr.io)
+
+jobs:
+  # ==========================================================================
+  # 构建并推送 Docker 镜像
+  # ==========================================================================
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 步骤1: 检出代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 步骤2: 设置 Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 步骤3: 登录 GitHub Container Registry
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      # 步骤4: 构建并推送镜像
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          # 启用 GitHub Actions 缓存加速构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: true
+          provenance: false
+          # 镜像标签: ghcr.io/{owner}/kiro-rs:custom
+          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:custom
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Kiro.rs Docker Image (dev_custom branch)
+            org.opencontainers.image.revision=${{ github.sha }}

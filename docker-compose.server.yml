@@ -1,0 +1,54 @@
+# ============================================================================
+# Docker Compose 配置文件 - 服务器部署专用
+# ============================================================================
+# 用途: 在服务器上拉取并运行 kiro-rs 的 custom 版本镜像
+#
+# 使用方法:
+#   1. 复制此文件到服务器
+#   2. 在同目录下创建 config.json 和 credentials.json 配置文件
+#   3. 运行: docker compose -f docker-compose.server.yml up -d
+#
+# 自动更新 (可选):
+#   - 镜像已配置 Watchtower 标签，如果你的服务器运行了 Watchtower
+#   - 当 ghcr.io 上的镜像更新时，Watchtower 会自动拉取新镜像并重启容器
+# ============================================================================
+
+services:
+  # Kiro.rs 服务
+  kiro-rs:
+    # 镜像地址: 从 GitHub Container Registry 拉取
+    # 使用 custom 标签，对应 dev_custom 分支构建的镜像
+    image: ghcr.io/love-gwen2025/kiro-rs:custom
+    container_name: kiro-rs
+    restart: unless-stopped
+
+    # 端口映射
+    # 绑定到 127.0.0.1 以便通过 Nginx 等反向代理访问
+    # 如果需要直接外网访问，可以改为 "8990:8990"
+    ports:
+      - "127.0.0.1:8990:8990"
+
+    # 配置文件挂载
+    volumes:
+      # config.json: 主配置文件 (只读)
+      - ./config.json:/app/config/config.json:ro
+      # credentials.json: 凭据配置文件 (可读写，用于 OAuth 刷新等)
+      - ./credentials.json:/app/config/credentials.json
+
+    # 允许容器访问宿主机网络服务 (如本地数据库等)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # 加入 1panel 网络 (可选，如果使用 1Panel 面板管理)
+    networks:
+      - 1panel-network
+
+    # Watchtower 自动更新标签
+    # 当 Watchtower 运行时，会自动检测并更新此容器
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+# 外部网络定义
+networks:
+  1panel-network:
+    external: true
