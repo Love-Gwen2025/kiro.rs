@@ -421,9 +421,7 @@ fn remove_orphaned_tool_uses(
 
     for msg in history.iter_mut() {
         if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) =
-                assistant_msg.assistant_response_message.tool_uses
-            {
+            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 let original_len = tool_uses.len();
                 tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
 
@@ -750,6 +748,34 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_sonnet() {
+        // thinking 后缀不应影响 sonnet 模型映射
+        let result = map_model("claude-sonnet-4-5-20250929-thinking");
+        assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_5() {
+        // thinking 后缀不应影响 opus 4.5 模型映射
+        let result = map_model("claude-opus-4-5-20251101-thinking");
+        assert_eq!(result, Some("claude-opus-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_opus_4_6() {
+        // thinking 后缀不应影响 opus 4.6 模型映射
+        let result = map_model("claude-opus-4-6-thinking");
+        assert_eq!(result, Some("claude-opus-4.6".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_thinking_suffix_haiku() {
+        // thinking 后缀不应影响 haiku 模型映射
+        let result = map_model("claude-haiku-4-5-20251001-thinking");
+        assert_eq!(result, Some("claude-haiku-4.5".to_string()));
     }
 
     #[test]
