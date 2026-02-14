@@ -617,8 +617,11 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
                 .last()
                 .map_or(true, |last| matches!(last, Message::Assistant(_)))
             {
-                // 保留前导/连续 assistant：补一个占位 user，避免 tool_use 在历史中丢失
-                history.push(Message::User(HistoryUserMessage::new(" ", model_id)));
+                // 保留前导/连续 assistant：补一个语义占位 user，避免上游将空白内容判定为无效历史
+                history.push(Message::User(HistoryUserMessage::new(
+                    "Continue with previous tool interaction.",
+                    model_id,
+                )));
             }
 
             // 添加 assistant 消息
@@ -980,6 +983,12 @@ mod tests {
             matches!(state.history.first(), Some(Message::User(_))),
             "前导 assistant 前应插入占位 user"
         );
+        if let Some(Message::User(leading_user)) = state.history.first() {
+            assert!(
+                !leading_user.user_input_message.content.trim().is_empty(),
+                "前导占位 user 不应为纯空白，避免上游判定无效"
+            );
+        }
         let has_tool_use = state.history.iter().any(|msg| {
             if let Message::Assistant(assistant) = msg {
                 return assistant
