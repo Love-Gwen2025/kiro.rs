@@ -611,11 +611,17 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
                 let merged_user = merge_user_messages(&user_buffer, model_id)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
-
-                // 添加 assistant 消息
-                let assistant = convert_assistant_message(msg)?;
-                history.push(Message::Assistant(assistant));
+            } else if history
+                .last()
+                .map_or(true, |last| matches!(last, Message::Assistant(_)))
+            {
+                // 保留前导/连续 assistant：补一个占位 user，避免 tool_use 在历史中丢失
+                history.push(Message::User(HistoryUserMessage::new(" ", model_id)));
             }
+
+            // 添加 assistant 消息
+            let assistant = convert_assistant_message(msg)?;
+            history.push(Message::Assistant(assistant));
         }
     }
 
@@ -920,6 +926,71 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    #[test]
+    fn test_convert_request_keeps_leading_assistant_tool_use_for_tool_result_only() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 首条 assistant 也应进入历史，否则后续 tool_result 会被误判为孤立结果
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-leading-1", "name": "read", "input": {"path": "/tmp/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-leading-1", "content": "ok"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("应成功转换");
+        let state = result.conversation_state;
+
+        let tool_results = &state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(tool_results.len(), 1, "tool_result 不应被误过滤");
+        assert_eq!(tool_results[0].tool_use_id, "tool-leading-1");
+        assert_eq!(
+            state.current_message.user_input_message.content, " ",
+            "tool_result-only 场景应使用空格占位"
+        );
+
+        assert!(
+            matches!(state.history.first(), Some(Message::User(_))),
+            "前导 assistant 前应插入占位 user"
+        );
+        let has_tool_use = state.history.iter().any(|msg| {
+            if let Message::Assistant(assistant) = msg {
+                return assistant
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .map_or(false, |uses| {
+                        uses.iter().any(|u| u.tool_use_id == "tool-leading-1")
+                    });
+            }
+            false
+        });
+        assert!(has_tool_use, "历史中应保留前导 assistant 的 tool_use");
     }
 
     #[test]
