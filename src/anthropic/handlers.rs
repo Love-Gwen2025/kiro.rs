@@ -172,6 +172,10 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidCurrentUserMessage => (
+                    "invalid_request_error",
+                    "最后一条用户消息为空：需要文本，或至少包含 tool_result/image".to_string(),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -187,6 +191,17 @@ pub async fn post_messages(
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
     };
+    let current_input = &kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message;
+    tracing::info!(
+        endpoint = "/v1/messages",
+        current_content_len = %current_input.content.chars().count(),
+        current_tool_results = %current_input.user_input_message_context.tool_results.len(),
+        current_images = %current_input.images.len(),
+        "Prepared currentMessage summary"
+    );
 
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
@@ -835,6 +850,10 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidCurrentUserMessage => (
+                    "invalid_request_error",
+                    "最后一条用户消息为空：需要文本，或至少包含 tool_result/image".to_string(),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -850,6 +869,17 @@ pub async fn post_messages_cc(
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
     };
+    let current_input = &kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message;
+    tracing::info!(
+        endpoint = "/cc/v1/messages",
+        current_content_len = %current_input.content.chars().count(),
+        current_tool_results = %current_input.user_input_message_context.tool_results.len(),
+        current_images = %current_input.images.len(),
+        "Prepared currentMessage summary"
+    );
 
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,

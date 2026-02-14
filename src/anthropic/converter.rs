@@ -63,6 +63,7 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    InvalidCurrentUserMessage,
 }
 
 impl std::fmt::Display for ConversionError {
@@ -70,6 +71,9 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::InvalidCurrentUserMessage => {
+                write!(f, "最后一条用户消息无有效内容")
+            }
         }
     }
 }
@@ -202,8 +206,13 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // 当只有 tool_results/images 时，使用空格占位避免上游 400 Improperly formed request
+    // 当既没有文本，也没有 tool_results/images 时，直接返回 400 给调用方
+    let content = normalize_user_content(
+        text_content,
+        !images.is_empty(),
+        !validated_tool_results.is_empty(),
+    )?;
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -230,6 +239,24 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 /// "AUTO" 模式可能会导致 400 Bad Request 错误
 fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
+}
+
+/// 规范化 user content，避免发送无效的 currentMessage
+fn normalize_user_content(
+    content: String,
+    has_images: bool,
+    has_tool_results: bool,
+) -> Result<String, ConversionError> {
+    if !content.trim().is_empty() {
+        return Ok(content);
+    }
+
+    if has_images || has_tool_results {
+        // 与 assistant/tool_use-only 的兜底策略保持一致
+        return Ok(" ".to_string());
+    }
+
+    Err(ConversionError::InvalidCurrentUserMessage)
 }
 
 /// 处理消息内容，提取文本、图片和工具结果
@@ -622,7 +649,11 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
+    let mut content = content_parts.join("\n");
+    if content.trim().is_empty() && (!all_images.is_empty() || !all_tool_results.is_empty()) {
+        // 用户消息只有 tool_results/images 时也必须保证 content 非空
+        content = " ".to_string();
+    }
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
