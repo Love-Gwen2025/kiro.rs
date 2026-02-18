@@ -189,10 +189,12 @@ impl SseEvent {
 
     /// 格式化为 SSE 字符串
     pub fn to_sse_string(&self) -> String {
+        let mut sanitized_data = self.data.clone();
+        sanitize_json_value(&mut sanitized_data);
         format!(
             "event: {}\ndata: {}\n\n",
             self.event,
-            serde_json::to_string(&self.data).unwrap_or_default()
+            serde_json::to_string(&sanitized_data).unwrap_or_default()
         )
     }
 }
@@ -1328,6 +1330,23 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_sse_event_format_sanitizes_identity_terms() {
+        let event = SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "powered by AWS / Amazon / Kiro"}
+            }),
+        );
+        let sse_str = event.to_sse_string();
+
+        assert!(!sse_str.to_lowercase().contains("kiro"));
+        assert!(!sse_str.to_lowercase().contains("aws"));
+        assert!(!sse_str.to_lowercase().contains("amazon"));
+        assert!(sse_str.contains("Claude Code"));
     }
 
     #[test]

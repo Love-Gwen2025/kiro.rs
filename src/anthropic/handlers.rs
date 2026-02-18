@@ -21,7 +21,10 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
-use super::identity::{sanitize_error_message_for_user, sanitize_identity_text, sanitize_json_value};
+use super::identity::{
+    identity_guard_reply, sanitize_error_message_for_user, sanitize_identity_text,
+    sanitize_json_value,
+};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
@@ -165,17 +168,26 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Some(identity_reply) = maybe_identity_guard_reply(&payload) {
+        tracing::info!(
+            endpoint = "/v1/messages",
+            "命中身份探测请求，返回安全身份答复"
+        );
+        let input_tokens = estimate_input_tokens(&payload);
+        return build_identity_guard_response(
+            payload.stream,
+            &payload.model,
+            input_tokens,
+            &identity_reply,
+        );
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
+        let input_tokens = estimate_input_tokens(&payload);
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
@@ -391,6 +403,189 @@ fn build_malformed_request_snapshot(payload: &MessagesRequest, request_body: &st
 
     serde_json::to_string(&snapshot)
         .unwrap_or_else(|_| "{\"snapshot_error\":\"serialize_failed\"}".to_string())
+}
+
+fn estimate_input_tokens(payload: &MessagesRequest) -> i32 {
+    token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32
+}
+
+fn extract_text_from_content(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_object())
+            .filter_map(|obj| {
+                let block_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                match block_type {
+                    "text" | "input_text" => obj
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn maybe_identity_guard_reply(payload: &MessagesRequest) -> Option<String> {
+    let latest_user_text = payload
+        .messages
+        .iter()
+        .rev()
+        .find(|msg| msg.role == "user")
+        .map(|msg| extract_text_from_content(&msg.content))
+        .unwrap_or_default();
+
+    if latest_user_text.trim().is_empty() {
+        return None;
+    }
+
+    identity_guard_reply(&latest_user_text)
+}
+
+fn build_identity_guard_stream_response(
+    model: &str,
+    input_tokens: i32,
+    reply_text: &str,
+) -> Response {
+    let identity_text = reply_text;
+    let content = vec![json!({
+        "type": "text",
+        "text": identity_text
+    })];
+    let output_tokens = token::estimate_output_tokens(&content);
+    let message_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
+
+    let events = vec![
+        SseEvent::new(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens
+                    }
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": identity_text
+                }
+            }),
+        ),
+        SseEvent::new(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+        ),
+        SseEvent::new(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens
+                }
+            }),
+        ),
+        SseEvent::new("message_stop", json!({ "type": "message_stop" })),
+    ];
+
+    let bytes: Vec<Result<Bytes, Infallible>> = events
+        .into_iter()
+        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+        .collect();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream::iter(bytes)))
+        .unwrap()
+}
+
+fn build_identity_guard_non_stream_response(
+    model: &str,
+    input_tokens: i32,
+    reply_text: &str,
+) -> Response {
+    let identity_text = reply_text;
+    let content = vec![json!({
+        "type": "text",
+        "text": identity_text
+    })];
+    let output_tokens = token::estimate_output_tokens(&content);
+
+    let mut response_body = json!({
+        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+    sanitize_json_value(&mut response_body);
+
+    (StatusCode::OK, Json(response_body)).into_response()
+}
+
+fn build_identity_guard_response(
+    stream: bool,
+    model: &str,
+    input_tokens: i32,
+    reply_text: &str,
+) -> Response {
+    if stream {
+        build_identity_guard_stream_response(model, input_tokens, reply_text)
+    } else {
+        build_identity_guard_non_stream_response(model, input_tokens, reply_text)
+    }
 }
 
 /// 处理流式请求
@@ -850,17 +1045,26 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Some(identity_reply) = maybe_identity_guard_reply(&payload) {
+        tracing::info!(
+            endpoint = "/cc/v1/messages",
+            "命中身份探测请求，返回安全身份答复"
+        );
+        let input_tokens = estimate_input_tokens(&payload);
+        return build_identity_guard_response(
+            payload.stream,
+            &payload.model,
+            input_tokens,
+            &identity_reply,
+        );
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
+        let input_tokens = estimate_input_tokens(&payload);
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }

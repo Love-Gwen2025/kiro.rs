@@ -9,6 +9,10 @@ RUN pnpm build
 FROM rust:1.92-alpine AS builder
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
+ENV CARGO_NET_RETRY=10 \
+    CARGO_HTTP_TIMEOUT=600 \
+    CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
