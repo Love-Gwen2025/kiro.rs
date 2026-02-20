@@ -276,7 +276,13 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            state.sanitize_identity,
+        )
+        .await;
     }
 
     // 转换请求
@@ -371,6 +377,7 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             cache_result,
+            state.sanitize_identity,
             "/v1/messages",
             &malformed_snapshot,
         )
@@ -383,6 +390,7 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             cache_result,
+            state.sanitize_identity,
             "/v1/messages",
             &malformed_snapshot,
         )
@@ -510,6 +518,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     cache_result: Option<cache::CacheResult>,
+    sanitize_identity: bool,
     endpoint: &'static str,
     malformed_snapshot: &str,
 ) -> Response {
@@ -524,9 +533,9 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = if let Some(cr) = cache_result {
-        StreamContext::new_with_cache(model, input_tokens, thinking_enabled, cr)
+        StreamContext::new_with_cache(model, input_tokens, thinking_enabled, sanitize_identity, cr)
     } else {
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled)
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, sanitize_identity)
     };
 
     // 生成初始事件
@@ -655,6 +664,7 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     cache_result: Option<cache::CacheResult>,
+    sanitize_identity: bool,
     endpoint: &'static str,
     malformed_snapshot: &str,
 ) -> Response {
@@ -781,7 +791,9 @@ async fn handle_non_stream_request(
     }
 
     // 统一净化非流式文本，避免身份词直出
-    text_content = sanitize_identity_text(&text_content);
+    if sanitize_identity {
+        text_content = sanitize_identity_text(&text_content);
+    }
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
@@ -820,7 +832,9 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": usage
     });
-    sanitize_json_value(&mut response_body);
+    if sanitize_identity {
+        sanitize_json_value(&mut response_body);
+    }
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -936,7 +950,13 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            state.sanitize_identity,
+        )
+        .await;
     }
 
     // 转换请求
@@ -1031,6 +1051,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             cache_result,
+            state.sanitize_identity,
             "/cc/v1/messages",
             &malformed_snapshot,
         )
@@ -1043,6 +1064,7 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             cache_result,
+            state.sanitize_identity,
             "/cc/v1/messages",
             &malformed_snapshot,
         )
@@ -1061,6 +1083,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     cache_result: Option<cache::CacheResult>,
+    sanitize_identity: bool,
     endpoint: &'static str,
     malformed_snapshot: &str,
 ) -> Response {
@@ -1075,9 +1098,15 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲流处理上下文
     let ctx = if let Some(cr) = cache_result {
-        BufferedStreamContext::new_with_cache(model, estimated_input_tokens, thinking_enabled, cr)
+        BufferedStreamContext::new_with_cache(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            sanitize_identity,
+            cr,
+        )
     } else {
-        BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled)
+        BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, sanitize_identity)
     };
 
     // 创建缓冲 SSE 流

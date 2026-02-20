@@ -475,6 +475,8 @@ pub struct StreamContext {
     pub tool_block_indices: HashMap<String, i32>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
+    /// 是否启用身份净化（将 kiro 等关键词替换为 Claude Code 等）
+    sanitize_identity: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// 是否在 thinking 块内
@@ -504,6 +506,7 @@ impl StreamContext {
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
+        sanitize_identity: bool,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -514,6 +517,7 @@ impl StreamContext {
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             thinking_enabled,
+            sanitize_identity,
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
@@ -532,9 +536,10 @@ impl StreamContext {
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
+        sanitize_identity: bool,
         cache_result: super::cache::CacheResult,
     ) -> Self {
-        let mut ctx = Self::new_with_thinking(model, input_tokens, thinking_enabled);
+        let mut ctx = Self::new_with_thinking(model, input_tokens, thinking_enabled, sanitize_identity);
         ctx.cache_result = Some(cache_result);
         ctx
     }
@@ -826,11 +831,19 @@ impl StreamContext {
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
-        let sanitized = self.text_identity_sanitizer.push_emit(text);
-        if sanitized.is_empty() {
-            return Vec::new();
+        if self.sanitize_identity {
+            let sanitized = self.text_identity_sanitizer.push_emit(text);
+            if sanitized.is_empty() {
+                return Vec::new();
+            }
+            self.create_text_delta_events_raw(&sanitized)
+        } else {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                self.create_text_delta_events_raw(text)
+            }
         }
-        self.create_text_delta_events_raw(&sanitized)
     }
 
     fn create_text_delta_events_raw(&mut self, text: &str) -> Vec<SseEvent> {
@@ -916,6 +929,13 @@ impl StreamContext {
         index: i32,
         thinking: &str,
     ) -> Vec<SseEvent> {
+        if !self.sanitize_identity {
+            if thinking.is_empty() {
+                return vec![self.create_thinking_delta_event(index, "")];
+            }
+            return vec![self.create_thinking_delta_event(index, thinking)];
+        }
+
         if thinking.is_empty() {
             let mut events = Vec::new();
             let tail = self.thinking_identity_sanitizer.flush();
@@ -1020,7 +1040,9 @@ impl StreamContext {
                 "input": {}
             }
         });
-        sanitize_json_value(&mut start_data);
+        if self.sanitize_identity {
+            sanitize_json_value(&mut start_data);
+        }
         let start_events =
             self.state_manager
                 .handle_content_block_start(block_index, "tool_use", start_data);
@@ -1030,11 +1052,15 @@ impl StreamContext {
         if !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
 
-            let sanitizer = self
-                .tool_identity_sanitizers
-                .entry(tool_use.tool_use_id.clone())
-                .or_insert_with(|| StreamTextSanitizer::new(4));
-            let sanitized_partial = sanitizer.push_emit(&tool_use.input);
+            let sanitized_partial = if self.sanitize_identity {
+                let sanitizer = self
+                    .tool_identity_sanitizers
+                    .entry(tool_use.tool_use_id.clone())
+                    .or_insert_with(|| StreamTextSanitizer::new(4));
+                sanitizer.push_emit(&tool_use.input)
+            } else {
+                tool_use.input.clone()
+            };
 
             if !sanitized_partial.is_empty() {
                 let mut delta_data = json!({
@@ -1045,7 +1071,9 @@ impl StreamContext {
                         "partial_json": sanitized_partial
                     }
                 });
-                sanitize_json_value(&mut delta_data);
+                if self.sanitize_identity {
+                    sanitize_json_value(&mut delta_data);
+                }
                 if let Some(delta_event) = self
                     .state_manager
                     .handle_content_block_delta(block_index, delta_data)
@@ -1056,23 +1084,25 @@ impl StreamContext {
         }
 
         if tool_use.stop {
-            if let Some(sanitizer) = self.tool_identity_sanitizers.get_mut(&tool_use.tool_use_id) {
-                let tail = sanitizer.flush();
-                if !tail.is_empty() {
-                    let mut delta_data = json!({
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": tail
+            if self.sanitize_identity {
+                if let Some(sanitizer) = self.tool_identity_sanitizers.get_mut(&tool_use.tool_use_id) {
+                    let tail = sanitizer.flush();
+                    if !tail.is_empty() {
+                        let mut delta_data = json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": tail
+                            }
+                        });
+                        sanitize_json_value(&mut delta_data);
+                        if let Some(delta_event) = self
+                            .state_manager
+                            .handle_content_block_delta(block_index, delta_data)
+                        {
+                            events.push(delta_event);
                         }
-                    });
-                    sanitize_json_value(&mut delta_data);
-                    if let Some(delta_event) = self
-                        .state_manager
-                        .handle_content_block_delta(block_index, delta_data)
-                    {
-                        events.push(delta_event);
                     }
                 }
             }
@@ -1083,7 +1113,9 @@ impl StreamContext {
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
-            self.tool_identity_sanitizers.remove(&tool_use.tool_use_id);
+            if self.sanitize_identity {
+                self.tool_identity_sanitizers.remove(&tool_use.tool_use_id);
+            }
         }
 
         events
@@ -1264,9 +1296,10 @@ impl BufferedStreamContext {
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
+        sanitize_identity: bool,
     ) -> Self {
         let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled);
+            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, sanitize_identity);
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1280,10 +1313,17 @@ impl BufferedStreamContext {
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
+        sanitize_identity: bool,
         cache_result: super::cache::CacheResult,
     ) -> Self {
         let inner =
-            StreamContext::new_with_cache(model, estimated_input_tokens, thinking_enabled, cache_result);
+            StreamContext::new_with_cache(
+                model,
+                estimated_input_tokens,
+                thinking_enabled,
+                sanitize_identity,
+                cache_result,
+            );
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1418,7 +1458,7 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, true);
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1479,7 +1519,7 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1686,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1738,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1758,7 +1798,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1787,7 +1827,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1819,7 +1859,7 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1848,7 +1888,7 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
@@ -1896,7 +1936,7 @@ mod tests {
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1919,7 +1959,7 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1941,7 +1981,7 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1965,7 +2005,7 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1998,7 +2038,7 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2053,7 +2093,7 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2074,7 +2114,7 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, true);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();

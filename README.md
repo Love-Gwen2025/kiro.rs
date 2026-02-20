@@ -188,6 +188,7 @@ docker-compose up
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `sanitizeIdentity` | boolean | `true` | 是否启用身份净化（会把 `kiro` / `kiro-rs` 等关键词替换为 `Claude Code`；关闭可避免 `kiro.rs` → `Claude Code.rs`） |
 
 完整配置示例：
 
@@ -209,9 +210,10 @@ docker-compose up
    "countTokensAuthType": "x-api-key",
    "proxyUrl": "http://127.0.0.1:7890",
    "proxyUsername": "user",
-   "proxyPassword": "pass",
-   "adminApiKey": "sk-admin-your-secret-key",
-   "loadBalancingMode": "priority"
+    "proxyPassword": "pass",
+    "adminApiKey": "sk-admin-your-secret-key",
+    "loadBalancingMode": "priority",
+    "sanitizeIdentity": true
 }
 ```
 

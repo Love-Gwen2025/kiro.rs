@@ -25,6 +25,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// Profile ARN（可选，用于请求）
     pub profile_arn: Option<String>,
+    /// 是否启用身份净化（将 kiro 等关键词替换为 Claude Code 等）
+    pub sanitize_identity: bool,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             profile_arn: None,
+            sanitize_identity: true,
         }
     }
 
@@ -46,6 +49,12 @@ impl AppState {
     /// 设置 Profile ARN
     pub fn with_profile_arn(mut self, arn: impl Into<String>) -> Self {
         self.profile_arn = Some(arn.into());
+        self
+    }
+
+    /// 设置是否启用身份净化
+    pub fn with_sanitize_identity(mut self, sanitize_identity: bool) -> Self {
+        self.sanitize_identity = sanitize_identity;
         self
     }
 }

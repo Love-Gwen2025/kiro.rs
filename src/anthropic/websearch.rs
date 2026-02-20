@@ -217,9 +217,16 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    sanitize_identity: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        sanitize_identity,
+    );
 
     stream::iter(
         events
@@ -235,9 +242,14 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    sanitize_identity: bool,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let query = sanitize_identity_text(query);
+    let query = if sanitize_identity {
+        sanitize_identity_text(query)
+    } else {
+        query.to_string()
+    };
     let message_id = format!(
         "msg_{}",
         Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
@@ -359,7 +371,7 @@ fn generate_websearch_events(
     ));
 
     // 8. content_block_delta (text_delta) - 生成搜索结果摘要
-    let summary = generate_search_summary(&query, &search_results);
+    let summary = generate_search_summary(&query, &search_results, sanitize_identity);
 
     // 分块发送文本
     let chunk_size = 100;
@@ -411,15 +423,21 @@ fn generate_websearch_events(
         }),
     ));
 
-    for event in &mut events {
-        sanitize_json_value(&mut event.data);
+    if sanitize_identity {
+        for event in &mut events {
+            sanitize_json_value(&mut event.data);
+        }
     }
 
     events
 }
 
 /// 生成搜索结果摘要
-fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> String {
+fn generate_search_summary(
+    query: &str,
+    results: &Option<WebSearchResults>,
+    sanitize_identity: bool,
+) -> String {
     let mut summary = format!("Here are the search results for \"{}\":\n\n", query);
 
     if let Some(results) = results {
@@ -441,7 +459,11 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 
     summary.push_str("\nPlease note that these are web search results and may not be fully accurate or up-to-date.");
 
-    sanitize_identity_text(&summary)
+    if sanitize_identity {
+        sanitize_identity_text(&summary)
+    } else {
+        summary
+    }
 }
 
 /// 处理 WebSearch 请求
@@ -449,6 +471,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    sanitize_identity: bool,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -481,8 +504,14 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        sanitize_identity,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -729,7 +758,7 @@ mod tests {
             error: None,
         };
 
-        let summary = generate_search_summary("test", &Some(results));
+        let summary = generate_search_summary("test", &Some(results), false);
 
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));

@@ -114,6 +114,7 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         first_credentials.profile_arn.clone(),
+        config.sanitize_identity,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

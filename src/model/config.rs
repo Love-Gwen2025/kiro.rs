@@ -94,9 +94,19 @@ pub struct Config {
     #[serde(default)]
     pub redis_url: Option<String>,
 
+    /// 是否净化身份相关文本（将 kiro 等关键词替换为 Claude Code 等）
+    ///
+    /// 默认开启，以避免上游/下游出现不期望的身份词直出。
+    #[serde(default = "default_sanitize_identity")]
+    pub sanitize_identity: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+fn default_sanitize_identity() -> bool {
+    true
 }
 
 fn default_host() -> String {
@@ -159,6 +169,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             redis_url: None,
+            sanitize_identity: default_sanitize_identity(),
             config_path: None,
         }
     }
