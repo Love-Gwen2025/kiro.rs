@@ -494,6 +494,8 @@ pub struct StreamContext {
     thinking_identity_sanitizer: StreamTextSanitizer,
     /// tool_use.input_json_delta 跨 chunk 身份净化器
     tool_identity_sanitizers: HashMap<String, StreamTextSanitizer>,
+    /// 缓存结果（用于 usage 输出）
+    pub cache_result: Option<super::cache::CacheResult>,
 }
 
 impl StreamContext {
@@ -521,11 +523,32 @@ impl StreamContext {
             text_identity_sanitizer: StreamTextSanitizer::new(4),
             thinking_identity_sanitizer: StreamTextSanitizer::new(4),
             tool_identity_sanitizers: HashMap::new(),
+            cache_result: None,
         }
+    }
+
+    /// 创建带缓存结果的 StreamContext
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        cache_result: super::cache::CacheResult,
+    ) -> Self {
+        let mut ctx = Self::new_with_thinking(model, input_tokens, thinking_enabled);
+        ctx.cache_result = Some(cache_result);
+        ctx
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let mut usage = json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": 1
+        });
+        if let Some(cache) = &self.cache_result {
+            usage["cache_creation_input_tokens"] = json!(cache.cache_creation_input_tokens);
+            usage["cache_read_input_tokens"] = json!(cache.cache_read_input_tokens);
+        }
         json!({
             "type": "message_start",
             "message": {
@@ -536,10 +559,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": usage
             }
         })
     }
@@ -1144,6 +1164,10 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
+        // 在决定是否需要“thinking-only 补空格”之前，先 flush 文本净化尾部，
+        // 避免把真实文本误判为“没有 text 内容”从而注入多余空格。
+        events.extend(self.flush_text_identity_tail_events());
+
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
@@ -1154,9 +1178,6 @@ impl StreamContext {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
         }
-
-        // 流结束前 flush 所有跨 chunk 身份净化尾部，避免末尾词片段漏检/丢字
-        events.extend(self.flush_text_identity_tail_events());
 
         let tool_ids: Vec<String> = self.tool_identity_sanitizers.keys().cloned().collect();
         for tool_id in tool_ids {
@@ -1194,10 +1215,24 @@ impl StreamContext {
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
-        );
+        let final_events = self.state_manager
+            .generate_final_events(final_input_tokens, self.output_tokens);
+
+        // 注入缓存字段到 message_delta 的 usage 中
+        if let Some(cache) = &self.cache_result {
+            for mut event in final_events {
+                if event.event == "message_delta" {
+                    if let Some(usage) = event.data.get_mut("usage") {
+                        usage["cache_creation_input_tokens"] = json!(cache.cache_creation_input_tokens);
+                        usage["cache_read_input_tokens"] = json!(cache.cache_read_input_tokens);
+                    }
+                }
+                events.push(event);
+            }
+        } else {
+            events.extend(final_events);
+        }
+
         events
     }
 }
@@ -1232,6 +1267,23 @@ impl BufferedStreamContext {
     ) -> Self {
         let inner =
             StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled);
+        Self {
+            inner,
+            event_buffer: Vec::new(),
+            estimated_input_tokens,
+            initial_events_generated: false,
+        }
+    }
+
+    /// 创建带缓存结果的缓冲流上下文
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        cache_result: super::cache::CacheResult,
+    ) -> Self {
+        let inner =
+            StreamContext::new_with_cache(model, estimated_input_tokens, thinking_enabled, cache_result);
         Self {
             inner,
             event_buffer: Vec::new(),

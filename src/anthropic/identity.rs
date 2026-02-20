@@ -230,18 +230,80 @@ impl StreamTextSanitizer {
             return String::new();
         }
 
+        // Keep only a suffix that could be the start of a banned canonical term, so we can
+        // detect identity strings split across chunks, without forcing normal text to be
+        // buffered or split (unit tests expect deltas to match input pieces).
         self.carry.push_str(piece);
-        let total_chars = self.carry.chars().count();
-        if total_chars <= self.keep_chars {
+
+        // Collect up to keep_chars trailing normalized (ascii-alnum) chars, skipping ignored separators.
+        let mut tail_norm_rev: Vec<char> = Vec::with_capacity(self.keep_chars);
+        let mut started = false;
+        for ch in self.carry.chars().rev() {
+            if let Some(nc) = normalize_match_char(ch) {
+                started = true;
+                tail_norm_rev.push(nc);
+                if tail_norm_rev.len() >= self.keep_chars {
+                    break;
+                }
+            } else if started && is_ignored_separator(ch) {
+                continue;
+            } else if started {
+                break;
+            }
+        }
+
+        if tail_norm_rev.is_empty() {
+            let out = std::mem::take(&mut self.carry);
+            return sanitize_identity_text(&out);
+        }
+
+        tail_norm_rev.reverse();
+        let tail_norm: String = tail_norm_rev.iter().collect();
+
+        // Find the longest suffix of tail_norm that is a prefix of any banned canonical term.
+        let mut keep_norm_len = 0usize;
+        for len in (1..=tail_norm.len()).rev() {
+            let start = tail_norm.len() - len;
+            let suffix = &tail_norm[start..];
+            if BANNED_CANONICAL_TERMS.iter().any(|t| t.starts_with(suffix)) {
+                keep_norm_len = len;
+                break;
+            }
+        }
+
+        if keep_norm_len == 0 {
+            let out = std::mem::take(&mut self.carry);
+            return sanitize_identity_text(&out);
+        }
+
+        // Map the normalized suffix length back to a byte index in the original string and split.
+        let mut need = keep_norm_len;
+        let mut keep_start = 0usize;
+        let mut started_keep = false;
+        for (idx, ch) in self.carry.char_indices().rev() {
+            if let Some(_) = normalize_match_char(ch) {
+                started_keep = true;
+                need = need.saturating_sub(1);
+                if need == 0 {
+                    keep_start = idx;
+                    break;
+                }
+            } else if started_keep && is_ignored_separator(ch) {
+                continue;
+            } else if started_keep {
+                break;
+            }
+        }
+
+        if keep_start == 0 {
+            // Keep everything (worst case); emit nothing yet.
             return String::new();
         }
 
-        let emit_chars = total_chars - self.keep_chars;
-        let emit: String = self.carry.chars().take(emit_chars).collect();
-        let tail: String = self.carry.chars().skip(emit_chars).collect();
-        self.carry = tail;
-
-        sanitize_identity_text(&emit)
+        let emitted = self.carry[..keep_start].to_string();
+        let kept = self.carry[keep_start..].to_string();
+        self.carry = kept;
+        sanitize_identity_text(&emitted)
     }
 
     pub fn flush(&mut self) -> String {

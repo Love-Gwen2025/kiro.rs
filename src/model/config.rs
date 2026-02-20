@@ -90,6 +90,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// Redis URL（可选，启用 prompt caching 模拟）
+    #[serde(default)]
+    pub redis_url: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -154,6 +158,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            redis_url: None,
             config_path: None,
         }
     }
