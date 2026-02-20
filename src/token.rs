@@ -204,9 +204,7 @@ fn count_all_tokens_local(
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
+                total += count_content_block_tokens(item);
             }
         }
     }
@@ -222,6 +220,45 @@ fn count_all_tokens_local(
     }
 
     total.max(1)
+}
+
+/// 计算单个 content block 的 token 数（支持 text、tool_use、tool_result）
+fn count_content_block_tokens(block: &serde_json::Value) -> u64 {
+    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match block_type {
+        "text" => {
+            block.get("text").and_then(|v| v.as_str()).map_or(0, count_tokens)
+        }
+        "tool_use" => {
+            let mut tokens = 0u64;
+            if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                tokens += count_tokens(name);
+            }
+            if let Some(input) = block.get("input") {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                tokens += count_tokens(&input_str);
+            }
+            tokens
+        }
+        "tool_result" => {
+            if let Some(content) = block.get("content") {
+                if let Some(s) = content.as_str() {
+                    count_tokens(s)
+                } else if let Some(arr) = content.as_array() {
+                    arr.iter().map(count_content_block_tokens).sum()
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        _ => {
+            let json_str = serde_json::to_string(block).unwrap_or_default();
+            count_tokens(&json_str)
+        }
+    }
 }
 
 /// 估算输出 tokens
