@@ -98,6 +98,11 @@ fn normalize_tool(tool: &Tool) -> String {
 ///
 /// 按 Anthropic 的顺序遍历 tools → system → messages，
 /// 遇到 cache_control 标记时记录当前累积哈希和 token 数。
+///
+/// 自动注入策略：当客户端未标记 cache_control 时，自动在以下位置注入断点：
+/// 1. 所有 tools 处理完毕后（如果没有任何 tool 标记了 cache_control）
+/// 2. 所有 system 处理完毕后（如果没有任何 system 标记了 cache_control）
+/// 3. 倒数第二条 message 的最后一个 content block（对话历史前缀）
 pub fn compute_cache_breakpoints(
     tools: &Option<Vec<Tool>>,
     system: &Option<Vec<SystemMessage>>,
@@ -108,43 +113,74 @@ pub fn compute_cache_breakpoints(
     let mut cumulative_tokens: i32 = 0;
 
     // 1. 处理 tools（按 name 排序确保顺序稳定）
+    let mut tools_has_cache_control = false;
     if let Some(tools) = tools {
         let mut sorted_tools: Vec<&Tool> = tools.iter().collect();
         sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
-        for tool in sorted_tools {
+        for tool in &sorted_tools {
             let normalized = normalize_tool(tool);
             hasher.update(normalized.as_bytes());
             cumulative_tokens += token::count_tokens(&normalized) as i32;
 
             if tool.cache_control.is_some() {
+                tools_has_cache_control = true;
                 breakpoints.push(CacheBreakpoint {
                     hash: format!("{:x}", hasher.clone().finalize()),
                     tokens: cumulative_tokens,
                 });
             }
         }
+
+        // 自动注入：tools 全部处理完但没有任何 cache_control 标记
+        if !tools_has_cache_control && !sorted_tools.is_empty() {
+            breakpoints.push(CacheBreakpoint {
+                hash: format!("{:x}", hasher.clone().finalize()),
+                tokens: cumulative_tokens,
+            });
+            tracing::debug!("Auto-injected breakpoint after tools, tokens={}", cumulative_tokens);
+        }
     }
 
     // 2. 处理 system
+    let mut system_has_cache_control = false;
     if let Some(system) = system {
         for msg in system {
             hasher.update(msg.text.as_bytes());
             cumulative_tokens += token::count_tokens(&msg.text) as i32;
 
             if msg.cache_control.is_some() {
+                system_has_cache_control = true;
                 breakpoints.push(CacheBreakpoint {
                     hash: format!("{:x}", hasher.clone().finalize()),
                     tokens: cumulative_tokens,
                 });
             }
         }
+
+        // 自动注入：system 全部处理完但没有任何 cache_control 标记
+        if !system_has_cache_control && !system.is_empty() {
+            breakpoints.push(CacheBreakpoint {
+                hash: format!("{:x}", hasher.clone().finalize()),
+                tokens: cumulative_tokens,
+            });
+            tracing::debug!("Auto-injected breakpoint after system, tokens={}", cumulative_tokens);
+        }
     }
 
     // 3. 处理 messages
-    for msg in messages {
+    // 自动注入策略：在倒数第二条 message 的最后一个 block 后注入断点
+    // 这样对话历史前缀（除最后一条消息外）都能被缓存覆盖
+    let second_to_last_idx = if messages.len() >= 2 {
+        Some(messages.len() - 2)
+    } else {
+        None
+    };
+
+    for (msg_idx, msg) in messages.iter().enumerate() {
         if let Some(blocks) = msg.content.as_array() {
-            for block in blocks {
+            let block_count = blocks.len();
+            for (block_idx, block) in blocks.iter().enumerate() {
                 let sorted_block = sort_json_value(block);
                 let block_json = serde_json::to_string(&sorted_block).unwrap_or_default();
                 hasher.update(block_json.as_bytes());
@@ -159,10 +195,40 @@ pub fn compute_cache_breakpoints(
                         tokens: cumulative_tokens,
                     });
                 }
+
+                // 自动注入：倒数第二条 message 的最后一个 block
+                let is_last_block = block_idx == block_count - 1;
+                if second_to_last_idx == Some(msg_idx)
+                    && is_last_block
+                    && block.get("cache_control").is_none()
+                {
+                    breakpoints.push(CacheBreakpoint {
+                        hash: format!("{:x}", hasher.clone().finalize()),
+                        tokens: cumulative_tokens,
+                    });
+                    tracing::debug!(
+                        "Auto-injected breakpoint after message[{}], tokens={}",
+                        msg_idx,
+                        cumulative_tokens
+                    );
+                }
             }
         } else if let Some(text) = msg.content.as_str() {
             hasher.update(text.as_bytes());
             cumulative_tokens += token::count_tokens(text) as i32;
+
+            // 自动注入：倒数第二条 message（纯文本形式）
+            if second_to_last_idx == Some(msg_idx) {
+                breakpoints.push(CacheBreakpoint {
+                    hash: format!("{:x}", hasher.clone().finalize()),
+                    tokens: cumulative_tokens,
+                });
+                tracing::debug!(
+                    "Auto-injected breakpoint after message[{}] (text), tokens={}",
+                    msg_idx,
+                    cumulative_tokens
+                );
+            }
         }
     }
 
