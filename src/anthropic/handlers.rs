@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 
+use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -26,6 +27,74 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+
+/// 将 KiroProvider 错误映射为 HTTP 响应
+fn map_provider_error(err: Error) -> Response {
+    let err_str = err.to_string();
+
+    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
+    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 单次输入太长（请求体本身超出上游限制）
+    if err_str.contains("Input is too long") {
+        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Input is too long. Reduce the size of your messages.",
+            )),
+        )
+            .into_response();
+    }
+    tracing::error!("Kiro API 调用失败: {}", err);
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse::new(
+            "api_error",
+            format!("上游 API 调用失败: {}", err),
+        )),
+    )
+        .into_response()
+}
+
+/// 记录 API 调用失败的详细日志（含请求体和格式快照，便于调试 400 等问题）
+fn log_api_failure(
+    endpoint: &str,
+    model: &str,
+    err: &Error,
+    request_body: &str,
+    malformed_snapshot: &str,
+) {
+    let err_msg = err.to_string();
+    if is_upstream_bad_request(&err_msg) {
+        tracing::warn!(
+            endpoint = endpoint,
+            model = %model,
+            error = %err_msg,
+            request_body = %request_body,
+            snapshot = %malformed_snapshot,
+            "上游返回 400，输出完整请求体和格式快照"
+        );
+    }
+    tracing::error!(
+        endpoint = endpoint,
+        model = %model,
+        error = %err_msg,
+        snapshot = %malformed_snapshot,
+        "Kiro API 调用失败"
+    );
+}
 
 /// GET /v1/models
 ///
@@ -407,34 +476,8 @@ async fn handle_stream_request(
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            let err_msg = e.to_string();
-            if is_upstream_bad_request(&err_msg) {
-                tracing::warn!(
-                    endpoint = endpoint,
-                    model = %model,
-                    error = %err_msg,
-                    request_body = %request_body,
-                    snapshot = %malformed_snapshot,
-                    "上游返回 400，输出完整请求体和格式快照"
-                );
-            }
-            tracing::error!(
-                endpoint = endpoint,
-                model = %model,
-                error = %err_msg,
-                request_body = %request_body,
-                snapshot = %malformed_snapshot,
-                "Kiro API 调用失败（含完整请求体）"
-            );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    //format!("上游 API 调用失败: {}", err_msg),
-                    sanitize_error_message_for_user(&e.to_string()),
-                )),
-            )
-                .into_response();
+            log_api_failure(endpoint, model, &e, request_body, malformed_snapshot);
+            return map_provider_error(e);
         }
     };
 
@@ -573,33 +616,8 @@ async fn handle_non_stream_request(
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            let err_msg = e.to_string();
-            if is_upstream_bad_request(&err_msg) {
-                tracing::warn!(
-                    endpoint = endpoint,
-                    model = %model,
-                    error = %err_msg,
-                    request_body = %request_body,
-                    snapshot = %malformed_snapshot,
-                    "上游返回 400，输出完整请求体和格式快照"
-                );
-            }
-            tracing::error!(
-                endpoint = endpoint,
-                model = %model,
-                error = %err_msg,
-                request_body = %request_body,
-                snapshot = %malformed_snapshot,
-                "Kiro API 调用失败（含完整请求体）"
-            );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    sanitize_error_message_for_user(&e.to_string()),
-                )),
-            )
-                .into_response();
+            log_api_failure(endpoint, model, &e, request_body, malformed_snapshot);
+            return map_provider_error(e);
         }
     };
 
@@ -655,14 +673,18 @@ async fn handle_non_stream_request(
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
-                                let input: serde_json::Value = serde_json::from_str(buffer)
-                                    .unwrap_or_else(|e| {
-                                        tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}, 原始内容: {}",
-                                            e, tool_use.tool_use_id, buffer
-                                        );
-                                        serde_json::json!({})
-                                    });
+                                let input: serde_json::Value = if buffer.is_empty() {
+                                    serde_json::json!({})
+                                } else {
+                                    serde_json::from_str(buffer)
+                                        .unwrap_or_else(|e| {
+                                            tracing::warn!(
+                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                                e, tool_use.tool_use_id
+                                            );
+                                            serde_json::json!({})
+                                        })
+                                };
 
                                 let mut tool_item = json!({
                                     "type": "tool_use",
@@ -983,33 +1005,8 @@ async fn handle_stream_request_buffered(
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            let err_msg = e.to_string();
-            if is_upstream_bad_request(&err_msg) {
-                tracing::warn!(
-                    endpoint = endpoint,
-                    model = %model,
-                    error = %err_msg,
-                    request_body = %request_body,
-                    snapshot = %malformed_snapshot,
-                    "上游返回 400，输出完整请求体和格式快照"
-                );
-            }
-            tracing::error!(
-                endpoint = endpoint,
-                model = %model,
-                error = %err_msg,
-                request_body = %request_body,
-                snapshot = %malformed_snapshot,
-                "Kiro API 调用失败（含完整请求体）"
-            );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    sanitize_error_message_for_user(&e.to_string()),
-                )),
-            )
-                .into_response();
+            log_api_failure(endpoint, model, &e, request_body, malformed_snapshot);
+            return map_provider_error(e);
         }
     };
 
