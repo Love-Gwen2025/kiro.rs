@@ -496,8 +496,6 @@ pub struct StreamContext {
     thinking_identity_sanitizer: StreamTextSanitizer,
     /// tool_use.input_json_delta 跨 chunk 身份净化器
     tool_identity_sanitizers: HashMap<String, StreamTextSanitizer>,
-    /// 缓存结果（用于 usage 输出）
-    pub cache_result: Option<super::cache::CacheResult>,
 }
 
 impl StreamContext {
@@ -527,38 +525,15 @@ impl StreamContext {
             text_identity_sanitizer: StreamTextSanitizer::new(4),
             thinking_identity_sanitizer: StreamTextSanitizer::new(4),
             tool_identity_sanitizers: HashMap::new(),
-            cache_result: None,
         }
-    }
-
-    /// 创建带缓存结果的 StreamContext
-    pub fn new_with_cache(
-        model: impl Into<String>,
-        input_tokens: i32,
-        thinking_enabled: bool,
-        sanitize_identity: bool,
-        cache_result: super::cache::CacheResult,
-    ) -> Self {
-        let mut ctx = Self::new_with_thinking(model, input_tokens, thinking_enabled, sanitize_identity);
-        ctx.cache_result = Some(cache_result);
-        ctx
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let mut input_tokens = self.input_tokens;
-        let mut usage = json!({
-            "input_tokens": input_tokens,
+        let usage = json!({
+            "input_tokens": self.input_tokens,
             "output_tokens": 1
         });
-        if let Some(cache) = &self.cache_result {
-            // Anthropic API: input_tokens = 非缓存部分
-            let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
-            input_tokens = (input_tokens - cached_tokens).max(0);
-            usage["input_tokens"] = json!(input_tokens);
-            usage["cache_creation_input_tokens"] = json!(cache.cache_creation_input_tokens);
-            usage["cache_read_input_tokens"] = json!(cache.cache_read_input_tokens);
-        }
         json!({
             "type": "message_start",
             "message": {
@@ -1249,32 +1224,13 @@ impl StreamContext {
         self.tool_identity_sanitizers.clear();
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let mut final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
-
-        // 缓存时扣减 input_tokens，使其表示非缓存部分
-        if let Some(cache) = &self.cache_result {
-            let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
-            final_input_tokens = (final_input_tokens - cached_tokens).max(0);
-        }
+        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
         let final_events = self.state_manager
             .generate_final_events(final_input_tokens, self.output_tokens);
 
-        // 注入缓存字段到 message_delta 的 usage 中
-        if let Some(cache) = &self.cache_result {
-            for mut event in final_events {
-                if event.event == "message_delta" {
-                    if let Some(usage) = event.data.get_mut("usage") {
-                        usage["cache_creation_input_tokens"] = json!(cache.cache_creation_input_tokens);
-                        usage["cache_read_input_tokens"] = json!(cache.cache_read_input_tokens);
-                    }
-                }
-                events.push(event);
-            }
-        } else {
-            events.extend(final_events);
-        }
+        events.extend(final_events);
 
         events
     }
@@ -1319,30 +1275,6 @@ impl BufferedStreamContext {
         }
     }
 
-    /// 创建带缓存结果的缓冲流上下文
-    pub fn new_with_cache(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-        sanitize_identity: bool,
-        cache_result: super::cache::CacheResult,
-    ) -> Self {
-        let inner =
-            StreamContext::new_with_cache(
-                model,
-                estimated_input_tokens,
-                thinking_enabled,
-                sanitize_identity,
-                cache_result,
-            );
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            estimated_input_tokens,
-            initial_events_generated: false,
-        }
-    }
-
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1378,16 +1310,10 @@ impl BufferedStreamContext {
         self.event_buffer.extend(final_events);
 
         // 获取正确的 input_tokens
-        let mut final_input_tokens = self
+        let final_input_tokens = self
             .inner
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
-
-        // 缓存时扣减 input_tokens，使其表示非缓存部分
-        if let Some(cache) = &self.inner.cache_result {
-            let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
-            final_input_tokens = (final_input_tokens - cached_tokens).max(0);
-        }
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {

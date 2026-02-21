@@ -90,10 +90,6 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
-    /// Redis URL（可选，启用 prompt caching 模拟）
-    #[serde(default)]
-    pub redis_url: Option<String>,
-
     /// 是否净化身份相关文本（将 kiro 等关键词替换为 Claude Code 等）
     ///
     /// 默认开启，以避免上游/下游出现不期望的身份词直出。
@@ -168,7 +164,6 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
-            redis_url: None,
             sanitize_identity: default_sanitize_identity(),
             config_path: None,
         }

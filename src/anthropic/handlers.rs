@@ -3,7 +3,6 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
-use crate::anthropic::cache;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -28,34 +27,6 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
-
-/// 从请求头中提取 API Key
-fn extract_api_key(headers: &HeaderMap) -> String {
-    headers
-        .get("x-api-key")
-        .or_else(|| headers.get("authorization"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim_start_matches("Bearer ").to_string())
-        .unwrap_or_default()
-}
-
-/// 计算缓存结果（如果 Redis 可用且请求中有 cache_control 标记）
-async fn compute_cache(
-    headers: &HeaderMap,
-    tools: &Option<Vec<super::types::Tool>>,
-    system: &Option<Vec<super::types::SystemMessage>>,
-    messages: &[super::types::Message],
-) -> Option<cache::CacheResult> {
-    if !cache::is_redis_available() {
-        return None;
-    }
-    let breakpoints = cache::compute_cache_breakpoints(tools, system, messages);
-    if breakpoints.is_empty() {
-        return None;
-    }
-    let api_key = extract_api_key(headers);
-    Some(cache::lookup_or_create(&api_key, &breakpoints).await)
-}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -235,7 +206,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -345,14 +316,6 @@ pub async fn post_messages(
     tracing::debug!("Kiro request body: {}", request_body);
     let malformed_snapshot = build_malformed_request_snapshot(&payload, &request_body);
 
-    // 计算缓存结果
-    let cache_result = compute_cache(
-        &headers,
-        &payload.tools,
-        &payload.system,
-        &payload.messages,
-    ).await;
-
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -376,7 +339,6 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
-            cache_result,
             state.sanitize_identity,
             "/v1/messages",
             &malformed_snapshot,
@@ -389,7 +351,6 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             input_tokens,
-            cache_result,
             state.sanitize_identity,
             "/v1/messages",
             &malformed_snapshot,
@@ -517,7 +478,6 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
-    cache_result: Option<cache::CacheResult>,
     sanitize_identity: bool,
     endpoint: &'static str,
     malformed_snapshot: &str,
@@ -532,11 +492,7 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = if let Some(cr) = cache_result {
-        StreamContext::new_with_cache(model, input_tokens, thinking_enabled, sanitize_identity, cr)
-    } else {
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, sanitize_identity)
-    };
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, sanitize_identity);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -663,7 +619,6 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
-    cache_result: Option<cache::CacheResult>,
     sanitize_identity: bool,
     endpoint: &'static str,
     malformed_snapshot: &str,
@@ -814,17 +769,10 @@ async fn handle_non_stream_request(
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
     // 构建 Anthropic 响应
-    let mut usage = json!({
+    let usage = json!({
         "input_tokens": final_input_tokens,
         "output_tokens": output_tokens
     });
-    if let Some(cr) = &cache_result {
-        // Anthropic API: input_tokens = 非缓存部分，total = input_tokens + cache_read + cache_creation
-        let cached_tokens = cr.cache_read_input_tokens + cr.cache_creation_input_tokens;
-        usage["input_tokens"] = json!((final_input_tokens - cached_tokens).max(0));
-        usage["cache_creation_input_tokens"] = json!(cr.cache_creation_input_tokens);
-        usage["cache_read_input_tokens"] = json!(cr.cache_read_input_tokens);
-    }
     let mut response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -911,7 +859,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1022,14 +970,6 @@ pub async fn post_messages_cc(
     tracing::debug!("Kiro request body: {}", request_body);
     let malformed_snapshot = build_malformed_request_snapshot(&payload, &request_body);
 
-    // 计算缓存结果
-    let cache_result = compute_cache(
-        &headers,
-        &payload.tools,
-        &payload.system,
-        &payload.messages,
-    ).await;
-
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -1053,7 +993,6 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
-            cache_result,
             state.sanitize_identity,
             "/cc/v1/messages",
             &malformed_snapshot,
@@ -1066,7 +1005,6 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
-            cache_result,
             state.sanitize_identity,
             "/cc/v1/messages",
             &malformed_snapshot,
@@ -1085,7 +1023,6 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
-    cache_result: Option<cache::CacheResult>,
     sanitize_identity: bool,
     endpoint: &'static str,
     malformed_snapshot: &str,
@@ -1100,17 +1037,7 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = if let Some(cr) = cache_result {
-        BufferedStreamContext::new_with_cache(
-            model,
-            estimated_input_tokens,
-            thinking_enabled,
-            sanitize_identity,
-            cr,
-        )
-    } else {
-        BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, sanitize_identity)
-    };
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, sanitize_identity);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

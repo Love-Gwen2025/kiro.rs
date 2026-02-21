@@ -270,9 +270,7 @@ fn generate_websearch_events(
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "output_tokens": 0
                 }
             }
         }),
@@ -567,16 +565,15 @@ mod tests {
             stream: true,
             system: None,
              tools: Some(vec![Tool {
-                 tool_type: Some("web_search_20250305".to_string()),
-                 name: "web_search".to_string(),
-                 description: String::new(),
-                 input_schema: Default::default(),
-                 max_uses: Some(8),
-                 cache_control: None,
-             }]),
-             tool_choice: None,
-             thinking: None,
-             output_config: None,
+                  tool_type: Some("web_search_20250305".to_string()),
+                  name: "web_search".to_string(),
+                  description: String::new(),
+                  input_schema: Default::default(),
+                  max_uses: Some(8),
+              }]),
+              tool_choice: None,
+              thinking: None,
+              output_config: None,
              metadata: None,
         };
 
@@ -597,25 +594,23 @@ mod tests {
             stream: true,
             system: None,
             tools: Some(vec![
-                 Tool {
-                     tool_type: Some("web_search_20250305".to_string()),
-                     name: "web_search".to_string(),
-                     description: String::new(),
-                     input_schema: Default::default(),
-                     max_uses: Some(8),
-                     cache_control: None,
-                 },
-                 Tool {
-                     tool_type: None,
-                     name: "other_tool".to_string(),
-                     description: "Other tool".to_string(),
-                     input_schema: Default::default(),
-                     max_uses: None,
-                     cache_control: None,
-                 },
-             ]),
-             tool_choice: None,
-             thinking: None,
+                  Tool {
+                      tool_type: Some("web_search_20250305".to_string()),
+                      name: "web_search".to_string(),
+                      description: String::new(),
+                      input_schema: Default::default(),
+                      max_uses: Some(8),
+                  },
+                  Tool {
+                      tool_type: None,
+                      name: "other_tool".to_string(),
+                      description: "Other tool".to_string(),
+                      input_schema: Default::default(),
+                      max_uses: None,
+                  },
+              ]),
+              tool_choice: None,
+              thinking: None,
              output_config: None,
             metadata: None,
         };
