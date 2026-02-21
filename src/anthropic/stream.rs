@@ -546,11 +546,16 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let mut input_tokens = self.input_tokens;
         let mut usage = json!({
-            "input_tokens": self.input_tokens,
+            "input_tokens": input_tokens,
             "output_tokens": 1
         });
         if let Some(cache) = &self.cache_result {
+            // Anthropic API: input_tokens = 非缓存部分
+            let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
+            input_tokens = (input_tokens - cached_tokens).max(0);
+            usage["input_tokens"] = json!(input_tokens);
             usage["cache_creation_input_tokens"] = json!(cache.cache_creation_input_tokens);
             usage["cache_read_input_tokens"] = json!(cache.cache_read_input_tokens);
         }
@@ -1244,7 +1249,13 @@ impl StreamContext {
         self.tool_identity_sanitizers.clear();
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let mut final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+
+        // 缓存时扣减 input_tokens，使其表示非缓存部分
+        if let Some(cache) = &self.cache_result {
+            let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
+            final_input_tokens = (final_input_tokens - cached_tokens).max(0);
+        }
 
         // 生成最终事件
         let final_events = self.state_manager
@@ -1367,10 +1378,16 @@ impl BufferedStreamContext {
         self.event_buffer.extend(final_events);
 
         // 获取正确的 input_tokens
-        let final_input_tokens = self
+        let mut final_input_tokens = self
             .inner
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
+
+        // 缓存时扣减 input_tokens，使其表示非缓存部分
+        if let Some(cache) = &self.inner.cache_result {
+            let cached_tokens = cache.cache_read_input_tokens + cache.cache_creation_input_tokens;
+            final_input_tokens = (final_input_tokens - cached_tokens).max(0);
+        }
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {

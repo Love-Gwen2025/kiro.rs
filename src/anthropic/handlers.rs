@@ -819,6 +819,9 @@ async fn handle_non_stream_request(
         "output_tokens": output_tokens
     });
     if let Some(cr) = &cache_result {
+        // Anthropic API: input_tokens = 非缓存部分，total = input_tokens + cache_read + cache_creation
+        let cached_tokens = cr.cache_read_input_tokens + cr.cache_creation_input_tokens;
+        usage["input_tokens"] = json!((final_input_tokens - cached_tokens).max(0));
         usage["cache_creation_input_tokens"] = json!(cr.cache_creation_input_tokens);
         usage["cache_read_input_tokens"] = json!(cr.cache_read_input_tokens);
     }
